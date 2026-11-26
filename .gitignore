@@ -1,0 +1,43 @@
+# Segredos — nunca versionar
+.env
+.env.*
+!.env.example
+*.pem
+*service-account*.json
+*credentials*.json
+
+# SO / editores
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+
+# Node
+node_modules/
+.next/
+out/
+dist/
+build/
+coverage/
+npm-debug.log*
+.firebase/
+
+# Java (Maven/Gradle)
+target/
+.gradle/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Flutter/Dart
+.dart_tool/
+.flutter-plugins*
+.packages
+*.iml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/

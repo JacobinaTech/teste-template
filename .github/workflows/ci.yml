@@ -1,0 +1,229 @@
+name: CI
+
+# Checks exigidos pelo ruleset da main:
+#   - branch-name: o nome da branch deve começar com feat/, fix/, ci/, doc/ ou teste/
+#   - build:       agregador — passa se todos os builds detectados passarem
+#
+# Detecção automática de stack (raiz e subpastas até 3 níveis, ex.: frontend/ e backend/):
+#   package.json → Node | pom.xml → Maven | build.gradle(.kts) → Gradle | pubspec.yaml → Flutter/Dart
+#   pyproject.toml / requirements.txt → Python | scripts/ci.sh → qualquer outra stack (Go, .NET, C…)
+#
+# Por que push E pull_request:
+# - PRs abertos pelo auto-pr.yml (GITHUB_TOKEN) pedem "Approve and run workflows" no pull_request;
+#   então, nas branches do próprio repo, os builds rodam no PUSH (o ruleset aceita o check do último commit).
+# - No pull_request, o branch-name roda sempre (pega branches fora do padrão); os builds só para forks.
+on:
+  push:
+    branches: ["feat/**", "fix/**", "ci/**", "doc/**", "teste/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  branch-name:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validar nome da branch
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          if [[ "$BRANCH" =~ ^(feat|fix|ci|doc|teste)/[a-z0-9][a-z0-9._/-]*$ ]]; then
+            echo "✅ Branch '$BRANCH' segue o padrão."
+          else
+            echo "::error title=Nome de branch inválido::'$BRANCH' não segue o padrão. Use feat/, fix/, ci/, doc/ ou teste/ + descrição (minúsculas, números e hífens). Ex.: feat/tela-de-login"
+            exit 1
+          fi
+
+  detect:
+    if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository }}
+    runs-on: ubuntu-latest
+    outputs:
+      node: ${{ steps.scan.outputs.node }}
+      maven: ${{ steps.scan.outputs.maven }}
+      gradle: ${{ steps.scan.outputs.gradle }}
+      flutter: ${{ steps.scan.outputs.flutter }}
+      python: ${{ steps.scan.outputs.python }}
+      custom: ${{ steps.scan.outputs.custom }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: scan
+        shell: python
+        run: |
+          import json, os
+          skip = {"node_modules", "build", "dist", "target", "out", "venv", ".venv", "ios", "android", "web", "linux", "macos", "windows"}
+          markers = {
+              "node": {"package.json"},
+              "maven": {"pom.xml"},
+              "gradle": {"build.gradle", "build.gradle.kts"},
+              "flutter": {"pubspec.yaml"},
+              "python": {"pyproject.toml", "requirements.txt"},
+          }
+          found = {k: [] for k in markers}
+          for root, dirs, files in os.walk("."):
+              depth = 0 if root == "." else root.count(os.sep)
+              dirs[:] = [d for d in dirs if d not in skip and not d.startswith(".")] if depth < 3 else []
+              path = os.path.normpath(root)
+              for stack, names in markers.items():
+                  # Só o diretório mais alto de cada stack (monorepos/multi-módulo rodam a partir da raiz deles).
+                  if names & set(files) and not any(path == p or path.startswith(p + os.sep) for p in found[stack] if p != "."):
+                      if "." not in found[stack]:
+                          found[stack].append(path)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              for stack, dirs_ in found.items():
+                  out.write(f"{stack}={json.dumps(dirs_)}\n")
+                  print(f"{stack}: {dirs_ or '—'}")
+              custom = os.path.isfile("scripts/ci.sh")
+              out.write(f"custom={'true' if custom else 'false'}\n")
+              print(f"custom (scripts/ci.sh): {custom}")
+
+  node:
+    needs: detect
+    if: ${{ needs.detect.outputs.node != '[]' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJSON(needs.detect.outputs.node) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: Instalar dependências
+        run: |
+          if [ -f pnpm-lock.yaml ]; then corepack enable && pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then corepack enable && yarn install --immutable
+          elif [ -f package-lock.json ]; then npm ci
+          else npm install; fi
+      - run: npm run lint --if-present
+      - run: npm run build --if-present
+      - run: npm test --if-present
+        env:
+          CI: "true"
+
+  maven:
+    needs: detect
+    if: ${{ needs.detect.outputs.maven != '[]' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJSON(needs.detect.outputs.maven) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - run: |
+          if [ -x ./mvnw ]; then ./mvnw -B -ntp verify; else mvn -B -ntp verify; fi
+
+  gradle:
+    needs: detect
+    if: ${{ needs.detect.outputs.gradle != '[]' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJSON(needs.detect.outputs.gradle) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+      - run: |
+          if [ -f ./gradlew ]; then chmod +x ./gradlew && ./gradlew build --no-daemon
+          else echo "::error::Projeto Gradle sem ./gradlew. Gere o wrapper com 'gradle wrapper' e faça commit."; exit 1; fi
+
+  flutter:
+    needs: detect
+    if: ${{ needs.detect.outputs.flutter != '[]' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJSON(needs.detect.outputs.flutter) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: if [ -d test ]; then flutter test; else echo "Sem pasta test/ — pulando testes."; fi
+
+  python:
+    needs: detect
+    if: ${{ needs.detect.outputs.python != '[]' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJSON(needs.detect.outputs.python) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Instalar dependências
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f pyproject.toml ]; then pip install -e .; fi
+      - name: Testes
+        run: |
+          if [ -d tests ] || [ -d test ] || ls test_*.py >/dev/null 2>&1; then pip install pytest && pytest
+          else echo "Sem testes — pulando."; fi
+
+  custom:
+    needs: detect
+    if: ${{ needs.detect.outputs.custom == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/ci.sh
+
+  # Check exigido pelo ruleset: falha se qualquer build detectado falhar.
+  build:
+    needs: [detect, node, maven, gradle, flutter, python, custom]
+    if: ${{ always() && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository) }}
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          RESULTS: ${{ toJSON(needs) }}
+        shell: python
+        run: |
+          import json, os, sys
+          results = {job: info["result"] for job, info in json.loads(os.environ["RESULTS"]).items()}
+          for job, result in results.items():
+              print(f"{job:<8} {result}")
+          failed = [j for j, r in results.items() if r in ("failure", "cancelled")]
+          if failed:
+              print(f"::error::Falharam: {', '.join(failed)}")
+              sys.exit(1)
+          if all(r == "skipped" for j, r in results.items() if j != "detect"):
+              print("::notice::Nenhuma stack detectada — só o nome da branch foi validado.")
